@@ -1,0 +1,386 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="theme-color" content="#000000">
+<title>USB Display</title>
+<style>
+  html,body{margin:0;height:100%;background:#000;overflow:hidden;overscroll-behavior:none;touch-action:none;
+    -webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:transparent;
+    font-family:system-ui,-apple-system,Roboto,"Segoe UI",sans-serif}
+  #c{position:fixed;left:0;top:0;width:100%;height:100%;object-fit:contain;touch-action:none;display:block}
+  #ov{position:fixed;left:0;top:0;right:0;bottom:0;display:flex;align-items:center;justify-content:center;
+    background:rgba(12,14,18,.94);color:#e8eaed;transition:opacity .2s}
+  #ov.hidden{opacity:0;pointer-events:none}
+  .card{max-width:560px;padding:24px 32px;text-align:center}
+  h1{font-size:22px;font-weight:600;margin:12px 0 6px;letter-spacing:.2px}
+  #st{font-size:15px;color:#a8adb4;min-height:1.4em;margin:0 0 22px}
+  #go{font:inherit;font-size:17px;font-weight:600;padding:14px 40px;border:0;border-radius:999px;background:#3b82f6;color:#fff}
+  #go:active{background:#2563eb}
+  .hint{font-size:12.5px;color:#7d848c;margin:18px 0 0;line-height:1.6}
+  .hint b{color:#b9bec5;font-weight:500}
+  #fs{position:fixed;right:12px;bottom:12px;width:44px;height:44px;border-radius:50%;border:0;
+    background:rgba(255,255,255,.14);color:#fff;display:none;font-size:20px;line-height:44px;padding:0}
+  #stats{position:fixed;left:6px;top:6px;padding:5px 9px;border-radius:6px;font:12px/1.45 ui-monospace,Menlo,monospace;
+    color:#9f9;background:rgba(0,0,0,.65);display:none;white-space:pre;pointer-events:none}
+</style>
+</head>
+<body>
+<canvas id="c" width="16" height="9"></canvas>
+<div id="ov"><div class="card">
+  <svg width="64" height="52" viewBox="0 0 64 52" aria-hidden="true">
+    <rect x="3" y="3" width="58" height="36" rx="4" fill="none" stroke="#e8eaed" stroke-width="3"/>
+    <rect x="9" y="9" width="46" height="24" rx="1.5" fill="#3b82f6"/>
+    <rect x="27" y="40" width="10" height="6" fill="#e8eaed"/><rect x="18" y="46" width="28" height="3" rx="1.5" fill="#e8eaed"/>
+  </svg>
+  <h1>USB Display</h1>
+  <p id="st">Подключение к ПК…</p>
+  <button id="go">Начать</button>
+  <p class="hint"><b>Касание</b> — щелчок · <b>удержание</b> — правая кнопка · <b>тянуть пальцем</b> — перетаскивание<br>
+    <b>два пальца</b> — прокрутка · <b>касание двумя</b> — правая кнопка · <b>три пальца</b> — статистика</p>
+</div></div>
+<button id="fs" aria-label="На весь экран">⛶</button>
+<div id="stats"></div>
+<script>
+(function () {
+  'use strict';
+  var $ = function (id) { return document.getElementById(id); };
+  var cv = $('c'), ov = $('ov'), st = $('st'), go = $('go'), fsBtn = $('fs'), statsEl = $('stats');
+  var params = new URLSearchParams(location.search);
+  var dev = params.get('d') || '', accessKey = params.get('k') || '';
+  var showStats = params.has('debug');
+  if (showStats) statsEl.style.display = 'block';
+
+  // desynchronized: кадр выводится в обход очереди композитора — меньше задержка
+  var ctx = cv.getContext('2d', { alpha: false, desynchronized: true });
+
+  var ws = null, decoder = null, codec = '', vw = 0, vh = 0, ts = 0, waitKey = true;
+  var started = false, streaming = false, frameSeen = false, h264ok = false, hz = 60;
+  var reconnectTimer = 0, streamInfo = '', decErrors = 0, frameDur = 16667;
+  var jpegBusy = false, jpegNext = null, lastKeyReq = 0, streamT0 = 0;
+  var rect = cv.getBoundingClientRect();
+  var S = { frames: 0, fps: 0, drop: 0, rtt: 0, lastT: performance.now(), lastF: 0 };
+
+  function status(t) { st.textContent = t; }
+  function send(o) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(o)); }
+
+  function updateOverlay() {
+    var live = streaming && frameSeen;
+    if (live && started) {
+      ov.classList.add('hidden');
+    } else {
+      ov.classList.remove('hidden');
+      ov.style.background = live ? 'rgba(12,14,18,.55)' : '';
+      if (live) status('Картинка идёт. Нажмите «Начать», чтобы развернуть на весь экран.');
+    }
+    fsBtn.style.display = (started && live && !document.fullscreenElement) ? 'block' : 'none';
+  }
+
+  // ---------- полноэкранный режим, ориентация, запрет сна ----------
+  var wl = null;
+  function wakeLock() {
+    if (!('wakeLock' in navigator) || wl) return;
+    navigator.wakeLock.request('screen').then(function (l) {
+      wl = l; l.addEventListener('release', function () { wl = null; });
+    }).catch(function () {});
+  }
+  function enterFullscreen() {
+    var el = document.documentElement;
+    var p = null;
+    try {
+      if (!document.fullscreenElement) {
+        if (el.requestFullscreen) p = el.requestFullscreen({ navigationUI: 'hide' });
+        else if (el.webkitRequestFullscreen) el.webkitRequestFullscreen();
+      }
+    } catch (e) {}
+    Promise.resolve(p).catch(function () {}).then(function () {
+      try { if (screen.orientation && screen.orientation.lock) screen.orientation.lock('landscape').catch(function () {}); } catch (e) {}
+    });
+    wakeLock();
+  }
+  go.addEventListener('click', function () {
+    started = true; go.style.display = 'none'; enterFullscreen(); updateOverlay();
+  });
+  fsBtn.addEventListener('click', function (e) { e.stopPropagation(); enterFullscreen(); });
+  document.addEventListener('fullscreenchange', function () { updateOverlay(); setTimeout(updRect, 200); });
+  document.addEventListener('visibilitychange', function () {
+    if (document.visibilityState === 'visible' && started) wakeLock();
+  });
+  function updRect() { rect = cv.getBoundingClientRect(); }
+  window.addEventListener('resize', updRect);
+
+  // ---------- возможности устройства ----------
+  function screenPx() {
+    var dpr = window.devicePixelRatio || 1;
+    var w = Math.round(screen.width * dpr), h = Math.round(screen.height * dpr);
+    if (h > w) { var t = w; w = h; h = t; }
+    return { w: w, h: h, dpr: dpr };
+  }
+  function measureHz() {
+    return new Promise(function (res) {
+      var n = 0, t0 = 0, done = false;
+      function fin(v) { if (!done) { done = true; res(v); } }
+      function f(t) {
+        if (!t0) t0 = t;
+        n++;
+        if (t - t0 >= 600) {
+          var r = (n - 1) * 1000 / (t - t0), c = [30, 60, 75, 90, 120, 144], best = 60;
+          c.forEach(function (v) { if (Math.abs(v - r) < Math.abs(best - r)) best = v; });
+          fin(best);
+        } else requestAnimationFrame(f);
+      }
+      requestAnimationFrame(f);
+      setTimeout(function () { fin(60); }, 1800);
+    });
+  }
+  function checkH264() {
+    if (!window.VideoDecoder || !window.EncodedVideoChunk) return Promise.resolve(false);
+    var list = ['avc1.640033', 'avc1.4D0033', 'avc1.42E033'];
+    var i = 0;
+    function next() {
+      if (i >= list.length) return Promise.resolve(false);
+      var c = list[i++];
+      return VideoDecoder.isConfigSupported({ codec: c, optimizeForLatency: true })
+        .then(function (r) { return r.supported ? true : next(); })
+        .catch(function () { return next(); });
+    }
+    return next();
+  }
+
+  // ---------- соединение ----------
+  function scheduleReconnect() { clearTimeout(reconnectTimer); reconnectTimer = setTimeout(connect, 1000); }
+  function connect() {
+    clearTimeout(reconnectTimer);
+    try { ws = new WebSocket('ws://' + location.host + '/ws'); } catch (e) { scheduleReconnect(); return; }
+    ws.binaryType = 'arraybuffer';
+    ws.onopen = function () {
+      var s = screenPx();
+      ws.send(JSON.stringify({ t: 'hello', w: s.w, h: s.h, dpr: s.dpr, hz: hz, h264: h264ok, dev: dev, k: accessKey, ua: navigator.userAgent }));
+      status('Соединение установлено, запуск…');
+    };
+    ws.onmessage = function (ev) {
+      if (typeof ev.data === 'string') {
+        var m; try { m = JSON.parse(ev.data); } catch (e) { return; }
+        onCtrl(m);
+      } else onFrame(new Uint8Array(ev.data));
+    };
+    ws.onclose = function () {
+      ws = null; streaming = false; frameSeen = false; closeDecoder();
+      status('Нет связи с ПК. Проверьте кабель — переподключаюсь…');
+      updateOverlay(); scheduleReconnect();
+    };
+    ws.onerror = function () {};
+  }
+
+  function onCtrl(m) {
+    if (m.t === 'status' || m.t === 'error') status(m.text);
+    else if (m.t === 'start') startStream(m);
+    else if (m.t === 'pong') S.rtt = performance.now() - m.ts;
+  }
+
+  function closeDecoder() {
+    if (decoder) { try { decoder.close(); } catch (e) {} }
+    decoder = null;
+  }
+
+  function startStream(m) {
+    closeDecoder();
+    codec = m.codec; vw = m.w; vh = m.h; ts = 0; waitKey = true; frameSeen = false; streamT0 = performance.now();
+    frameDur = Math.round(1e6 / (m.fps || 60));
+    streamInfo = m.enc + '  ' + m.w + '×' + m.h + ' @' + m.fps;
+    if (cv.width !== vw || cv.height !== vh) { cv.width = vw; cv.height = vh; }
+    updRect();
+    if (codec === 'h264') {
+      var bin = atob(m.desc), desc = new Uint8Array(bin.length);
+      for (var i = 0; i < bin.length; i++) desc[i] = bin.charCodeAt(i);
+      makeDecoder({ codec: m.cs, description: desc, optimizeForLatency: true });
+    }
+    streaming = true;
+    status('Видео запускается…');
+  }
+
+  function makeDecoder(cfg) {
+    var dec = new VideoDecoder({
+      output: function (frame) { if (dec !== decoder) { frame.close(); return; } draw(frame); },
+      error: function (e) {
+        if (dec !== decoder) return;
+        decoder = null; decErrors++;
+        console.warn('decoder', e);
+        send({ t: decErrors > 2 ? 'fallback' : 'key' });
+      }
+    });
+    try { dec.configure(cfg); } catch (e) { send({ t: 'fallback' }); return; }
+    decoder = dec;
+  }
+
+  function draw(src) {
+    var w = src.displayWidth || src.width, h = src.displayHeight || src.height;
+    if (cv.width !== w || cv.height !== h) { cv.width = w; cv.height = h; vw = w; vh = h; updRect(); }
+    ctx.drawImage(src, 0, 0);
+    if (src.close) src.close();
+    S.frames++;
+    if (!frameSeen) { frameSeen = true; decErrors = 0; updateOverlay(); }
+  }
+
+  function onFrame(u8) {
+    var flags = u8[0];
+    if (flags & 2) { onJpeg(u8.subarray(1)); return; }
+    if (!decoder || decoder.state !== 'configured') return;
+    var key = (flags & 1) !== 0;
+    if (waitKey) { if (!key) { S.drop++; return; } waitKey = false; }
+    // Декодер долго не успевает (очередь > ~0,25 с; первые 2 с — прогрев декодера): сбрасываем очередь и просим
+    // ПК сразу прислать ключевой кадр, чтобы задержка не копилась.
+    if (frameSeen && decoder.decodeQueueSize > 16 && performance.now() - streamT0 > 2000) {
+      S.drop++; waitKey = true;
+      var now = performance.now();
+      if (now - lastKeyReq > 3000) { lastKeyReq = now; send({ t: 'key' }); }
+      return;
+    }
+    var chunk = new EncodedVideoChunk({ type: key ? 'key' : 'delta', timestamp: ts, data: u8.subarray(1) });
+    ts += frameDur;
+    try { decoder.decode(chunk); } catch (e) { waitKey = true; }
+  }
+
+  function onJpeg(bytes) {
+    if (jpegBusy) { if (jpegNext) S.drop++; jpegNext = bytes; return; }
+    decodeJpeg(bytes);
+  }
+  function decodeJpeg(bytes) {
+    jpegBusy = true;
+    var blob = new Blob([bytes], { type: 'image/jpeg' });
+    function done() {
+      jpegBusy = false;
+      if (jpegNext) { var n = jpegNext; jpegNext = null; decodeJpeg(n); }
+    }
+    if (window.createImageBitmap) {
+      createImageBitmap(blob).then(function (b) { draw(b); done(); }).catch(done);
+    } else {
+      var url = URL.createObjectURL(blob), img = new Image();
+      img.onload = function () { draw(img); URL.revokeObjectURL(url); done(); };
+      img.onerror = function () { URL.revokeObjectURL(url); done(); };
+      img.src = url;
+    }
+  }
+
+  // ---------- ввод ----------
+  function norm(cx, cy) {
+    if (!vw || !vh || !rect.width) return [0.5, 0.5];
+    var sc = Math.min(rect.width / vw, rect.height / vh);
+    var w = vw * sc, h = vh * sc;
+    var ox = rect.left + (rect.width - w) / 2, oy = rect.top + (rect.height - h) / 2;
+    return [Math.min(1, Math.max(0, (cx - ox) / w)), Math.min(1, Math.max(0, (cy - oy) / h))];
+  }
+  var touches = new Map(), g = null, holdT = 0, rawSeen = {};
+  var TAP_SLOP = 10, HOLD_MS = 450;
+  function cancelHold() { clearTimeout(holdT); holdT = 0; }
+  function centroid() {
+    var x = 0, y = 0;
+    touches.forEach(function (p) { x += p.x; y += p.y; });
+    var n = touches.size || 1;
+    return { x: x / n, y: y / n };
+  }
+  function click(b, x, y) { send({ t: 'd', b: b, x: x, y: y }); send({ t: 'u', b: b, x: x, y: y }); }
+  function wheelK() { // единиц колеса на CSS-пиксель движения пальцев
+    var sc = (vw && rect.width) ? vw / rect.width : 1;
+    return 2.4 * sc;
+  }
+
+  cv.addEventListener('pointerdown', function (e) {
+    e.preventDefault();
+    try { cv.setPointerCapture(e.pointerId); } catch (_) {}
+    var n = norm(e.clientX, e.clientY);
+    if (e.pointerType === 'mouse') { send({ t: 'd', b: e.button, x: n[0], y: n[1] }); return; }
+    touches.set(e.pointerId, { x: e.clientX, y: e.clientY, sx: e.clientX, sy: e.clientY });
+    if (touches.size === 1) {
+      send({ t: 'm', x: n[0], y: n[1] });
+      g = { mode: 'pending', x: n[0], y: n[1], t: performance.now() };
+      holdT = setTimeout(function () {
+        if (g && g.mode === 'pending') {
+          click(2, g.x, g.y); g.mode = 'ignore';
+          if (navigator.vibrate) navigator.vibrate(12);
+        }
+      }, HOLD_MS);
+    } else if (touches.size === 2 && g && (g.mode === 'pending' || g.mode === 'drag')) {
+      cancelHold();
+      if (g.mode === 'drag') send({ t: 'u', b: 0, x: g.lx, y: g.ly });
+      var c = centroid(), cn = norm(c.x, c.y);
+      g = { mode: 'two', cx: c.x, cy: c.y, moved: 0, t: performance.now(), ay: 0, ax: 0, rx: cn[0], ry: cn[1] };
+    } else if (touches.size === 3) {
+      cancelHold();
+      showStats = !showStats; statsEl.style.display = showStats ? 'block' : 'none';
+      g = { mode: 'ignore' };
+    }
+  }, { passive: false });
+
+  function onMove(e) {
+    if (e.pointerType === 'mouse') { var m = norm(e.clientX, e.clientY); send({ t: 'm', x: m[0], y: m[1] }); return; }
+    var p = touches.get(e.pointerId);
+    if (!p || !g) return;
+    p.x = e.clientX; p.y = e.clientY;
+    if (g.mode === 'pending' && Math.hypot(p.x - p.sx, p.y - p.sy) > TAP_SLOP) {
+      cancelHold(); g.mode = 'drag'; g.lx = g.x; g.ly = g.y;
+      send({ t: 'd', b: 0, x: g.x, y: g.y });
+    }
+    if (g.mode === 'drag') {
+      var n = norm(p.x, p.y); g.lx = n[0]; g.ly = n[1];
+      send({ t: 'm', x: n[0], y: n[1] });
+    } else if (g.mode === 'two') {
+      var c = centroid(), dx = c.x - g.cx, dy = c.y - g.cy, k = wheelK();
+      g.cx = c.x; g.cy = c.y; g.moved += Math.abs(dx) + Math.abs(dy);
+      g.ay += dy * k; g.ax += -dx * k; // палец вниз — прокрутка вверх (как на сенсорном экране)
+      var wy = Math.trunc(g.ay), wx = Math.trunc(g.ax);
+      if (wy || wx) { g.ay -= wy; g.ax -= wx; send({ t: 'w', dx: wx, dy: wy }); }
+    }
+  }
+  // pointerrawupdate приходит без привязки к кадрам — курсор движется быстрее
+  cv.addEventListener('pointerrawupdate', function (e) { rawSeen[e.pointerType] = true; onMove(e); });
+  cv.addEventListener('pointermove', function (e) { if (!rawSeen[e.pointerType]) onMove(e); });
+
+  function onUp(e, cancelled) {
+    if (e.pointerType === 'mouse') { var m = norm(e.clientX, e.clientY); send({ t: 'u', b: e.button, x: m[0], y: m[1] }); return; }
+    if (!touches.has(e.pointerId)) return;
+    touches.delete(e.pointerId);
+    if (!g) return;
+    if (g.mode === 'pending') {
+      cancelHold();
+      if (!cancelled) click(0, g.x, g.y);
+      g = touches.size ? { mode: 'ignore' } : null;
+    } else if (g.mode === 'drag') {
+      send({ t: 'u', b: 0, x: g.lx, y: g.ly });
+      g = touches.size ? { mode: 'ignore' } : null;
+    } else if (g.mode === 'two' || g.mode === 'twoUp') {
+      if (touches.size > 0) { g.mode = 'twoUp'; return; }
+      if (!cancelled && g.moved < 14 && performance.now() - g.t < 400) click(2, g.rx, g.ry);
+      g = null;
+    } else if (touches.size === 0) g = null;
+  }
+  cv.addEventListener('pointerup', function (e) { onUp(e, false); });
+  cv.addEventListener('pointercancel', function (e) { onUp(e, true); });
+  cv.addEventListener('contextmenu', function (e) { e.preventDefault(); });
+  cv.addEventListener('wheel', function (e) {
+    e.preventDefault();
+    var k = e.deltaMode === 1 ? 40 : (e.deltaMode === 2 ? 800 : 1);
+    send({ t: 'w', dx: Math.round(e.deltaX * k * 1.2), dy: Math.round(-e.deltaY * k * 1.2) });
+  }, { passive: false });
+
+  // ---------- статистика ----------
+  setInterval(function () { send({ t: 'ping', ts: performance.now() }); }, 2000);
+  setInterval(function () {
+    var now = performance.now();
+    S.fps = (S.frames - S.lastF) * 1000 / (now - S.lastT); S.lastF = S.frames; S.lastT = now;
+    if (showStats) {
+      statsEl.textContent = streamInfo + '\n' +
+        'кадров/с ' + S.fps.toFixed(0) + '   пинг ' + S.rtt.toFixed(1) + ' мс\n' +
+        'очередь ' + (decoder ? decoder.decodeQueueSize : 0) + '   пропущено ' + S.drop + '\n' +
+        (codec || '—') + (h264ok ? '' : '  (WebCodecs нет)') + '   экран ' + hz + ' Гц';
+    }
+  }, 500);
+
+  // ---------- старт ----------
+  status('Подключение к ПК…');
+  Promise.all([checkH264(), measureHz()]).then(function (r) { h264ok = r[0]; hz = r[1]; connect(); });
+})();
+</script>
+</body>
+</html>

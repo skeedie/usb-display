@@ -1,0 +1,48 @@
+plugins {
+    id 'com.android.application'
+}
+
+// Номер версии передаёт сборка на GitHub (-PversionCode=N): программа на ПК
+// сравнивает его с установленным и при необходимости обновляет приложение.
+def vc = (project.findProperty('versionCode') ?: '1') as Integer
+
+android {
+    namespace 'com.usbdisplay.client'
+    compileSdk 35
+
+    defaultConfig {
+        applicationId 'com.usbdisplay.client'
+        minSdk 21
+        targetSdk 35
+        versionCode vc
+        versionName "2.0.${vc}"
+    }
+
+    // Постоянный ключ: обновления ставятся поверх без удаления приложения.
+    signingConfigs {
+        release {
+            storeFile file('usbdisplay.keystore')
+            storeType 'pkcs12'
+            storePassword 'usbdisplay'
+            keyAlias 'usbdisplay'
+            keyPassword 'usbdisplay'
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            signingConfig signingConfigs.release
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+    }
+
+    lint {
+        abortOnError false
+        checkReleaseBuilds false
+    }
+}
