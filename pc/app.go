@@ -231,6 +231,9 @@ func (a *App) run() {
 	go a.serveNative(cfg.NativePort)
 	log.Printf("для проверки в браузере ПК: http://127.0.0.1:%d/?k=%s", cfg.Port, cfg.Token)
 
+	if cfg.FirstRunDone && autostartEnabled() {
+		_ = setAutostart(true) // программу могли переместить или обновить — пусть автозапуск указывает на эту копию
+	}
 	if !cfg.FirstRunDone {
 		if err := setAutostart(true); err != nil {
 			log.Printf("autostart: %v", err)

@@ -25,6 +25,7 @@ func platformInit()           {}
 func platformShutdown()       {}
 func vddAvailable() bool      { return os.Getenv("USBDISPLAY_FAKE_VDD") == "1" }
 func setAutostart(bool) error { return nil }
+func autostartEnabled() bool  { return false }
 func hideWindow(*exec.Cmd)    {}
 func attachChild(*exec.Cmd)   {}
 
